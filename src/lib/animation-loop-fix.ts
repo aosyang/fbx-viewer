@@ -1,5 +1,12 @@
 import * as THREE from "three";
 
+export type AnimationLoopFixMode = "cyclic" | "inertial";
+
+export type AnimationLoopFixOptions = {
+  mode?: AnimationLoopFixMode;
+  inertialHalfLife?: number;
+};
+
 export type AnimationLoopFixReport = {
   repairedPositionTracks: number;
   repairedQuaternionTracks: number;
@@ -7,6 +14,8 @@ export type AnimationLoopFixReport = {
 };
 
 type TrackFilter = (track: THREE.KeyframeTrack) => boolean;
+
+const DEFAULT_INERTIAL_HALF_LIFE = 0.09;
 
 function quinticCorrection(
   c0: number,
@@ -25,7 +34,6 @@ function quinticCorrection(
   const t3 = t2 * t;
   return a3 * t3 + a4 * t3 * t + a5 * t3 * t2;
 }
-
 
 export function repairLoopScalarSamples(source: ArrayLike<number>): Float32Array {
   const count = source.length;
@@ -49,7 +57,51 @@ export function repairLoopScalarSamples(source: ArrayLike<number>): Float32Array
   return corrected;
 }
 
-function repairVectorTrack(track: THREE.VectorKeyframeTrack) {
+function finiteSupportDecay(time: number, duration: number, halfLife: number) {
+  const lambda = Math.LN2 / Math.max(1e-4, halfLife);
+  const horizon = Math.max(1e-4, Math.min(duration, halfLife * 6));
+  const s = THREE.MathUtils.clamp(time / horizon, 0, 1);
+  const cutoff = 1 - (3 * s * s - 2 * s * s * s);
+  return { lambda, cutoff };
+}
+
+export function repairLoopScalarSamplesInertial(
+  source: ArrayLike<number>,
+  times: ArrayLike<number>,
+  halfLife = DEFAULT_INERTIAL_HALF_LIFE,
+): Float32Array {
+  const count = source.length;
+  const corrected = new Float32Array(count);
+  for (let i = 0; i < count; i += 1) corrected[i] = Number(source[i]);
+  if (count < 3 || times.length !== count) return corrected;
+
+  const t0 = Number(times[0]);
+  const duration = Math.max(1e-4, Number(times[count - 1]) - t0);
+  const startDt = Math.max(1e-6, Number(times[1]) - Number(times[0]));
+  const endDt = Math.max(1e-6, Number(times[count - 1]) - Number(times[count - 2]));
+  const start = Number(source[0]);
+  const end = Number(source[count - 1]);
+  const startVelocity = (Number(source[1]) - start) / startDt;
+  const endVelocity = (end - Number(source[count - 2])) / endDt;
+  const positionOffset = end - start;
+  const velocityOffset = endVelocity - startVelocity;
+  const lambda = Math.LN2 / Math.max(1e-4, halfLife);
+  const linearTerm = velocityOffset + lambda * positionOffset;
+
+  for (let i = 0; i < count; i += 1) {
+    const time = Math.max(0, Number(times[i]) - t0);
+    const { cutoff } = finiteSupportDecay(time, duration, halfLife);
+    const correction = (positionOffset + linearTerm * time) * Math.exp(-lambda * time) * cutoff;
+    corrected[i] = Number(source[i]) + correction;
+  }
+  return corrected;
+}
+
+function repairVectorTrack(
+  track: THREE.VectorKeyframeTrack,
+  mode: AnimationLoopFixMode,
+  inertialHalfLife: number,
+) {
   const count = track.times.length;
   if (count < 4 || track.values.length !== count * 3) return false;
   const values = track.values;
@@ -58,7 +110,9 @@ function repairVectorTrack(track: THREE.VectorKeyframeTrack) {
 
   for (let axis = 0; axis < 3; axis += 1) {
     const axisValues = Array.from({ length: count }, (_, index) => Number(values[index * 3 + axis]));
-    const repaired = repairLoopScalarSamples(axisValues);
+    const repaired = mode === "inertial"
+      ? repairLoopScalarSamplesInertial(axisValues, track.times, inertialHalfLife)
+      : repairLoopScalarSamples(axisValues);
     for (let i = 0; i < count; i += 1) corrected[i * 3 + axis] = repaired[i];
   }
 
@@ -110,12 +164,12 @@ function quaternionExp(rotationVector: THREE.Vector3) {
   );
 }
 
-function repairQuaternionTrack(track: THREE.QuaternionKeyframeTrack) {
-  const count = track.times.length;
-  if (count < 4 || track.values.length !== count * 4) return false;
-
-  const quaternions = Array.from({ length: count }, (_, index) => quaternionAt(track.values, index));
-  for (let i = 1; i < count; i += 1) {
+function continuousQuaternions(track: THREE.QuaternionKeyframeTrack) {
+  const quaternions = Array.from(
+    { length: track.times.length },
+    (_, index) => quaternionAt(track.values, index),
+  );
+  for (let i = 1; i < quaternions.length; i += 1) {
     if (quaternions[i - 1].dot(quaternions[i]) < 0) {
       quaternions[i].x *= -1;
       quaternions[i].y *= -1;
@@ -123,6 +177,13 @@ function repairQuaternionTrack(track: THREE.QuaternionKeyframeTrack) {
       quaternions[i].w *= -1;
     }
   }
+  return quaternions;
+}
+
+function repairQuaternionTrackCyclic(track: THREE.QuaternionKeyframeTrack) {
+  const count = track.times.length;
+  if (count < 4 || track.values.length !== count * 4) return false;
+  const quaternions = continuousQuaternions(track);
 
   const startVelocity = quaternionStep(quaternions[0], quaternions[1]);
   const nextVelocity = quaternionStep(quaternions[1], quaternions[2]);
@@ -149,23 +210,54 @@ function repairQuaternionTrack(track: THREE.QuaternionKeyframeTrack) {
     corrected[offset + 2] = q.z;
     corrected[offset + 3] = q.w;
   }
-
   track.values = corrected;
   return true;
 }
 
-/**
- * Repairs the active animation for cyclic playback while keeping the first pose fixed.
- *
- * This is the browser-side counterpart of vrm-fbx-conversion-lab/repair_cyclic_animation.py:
- * position tracks receive a smooth endpoint correction matching C0/C1/C2, while quaternion
- * tracks receive the correction in SO(3) tangent space rather than by blending Euler angles.
- * Callers should filter to articulated Bone tracks so scene/root motion is preserved.
- */
+function repairQuaternionTrackInertial(
+  track: THREE.QuaternionKeyframeTrack,
+  halfLife: number,
+) {
+  const count = track.times.length;
+  if (count < 3 || track.values.length !== count * 4) return false;
+  const quaternions = continuousQuaternions(track);
+  const t0 = Number(track.times[0]);
+  const duration = Math.max(1e-4, Number(track.times[count - 1]) - t0);
+  const startDt = Math.max(1e-6, Number(track.times[1]) - Number(track.times[0]));
+  const endDt = Math.max(1e-6, Number(track.times[count - 1]) - Number(track.times[count - 2]));
+  const poseOffset = quaternionStep(quaternions[0], quaternions[count - 1]);
+  const startVelocity = quaternionStep(quaternions[0], quaternions[1]).multiplyScalar(1 / startDt);
+  const endVelocity = quaternionStep(quaternions[count - 2], quaternions[count - 1]).multiplyScalar(1 / endDt);
+  const velocityOffset = endVelocity.sub(startVelocity);
+  const lambda = Math.LN2 / Math.max(1e-4, halfLife);
+  const linearTerm = velocityOffset.addScaledVector(poseOffset, lambda);
+
+  const corrected = new Float32Array(count * 4);
+  for (let i = 0; i < count; i += 1) {
+    const time = Math.max(0, Number(track.times[i]) - t0);
+    const { cutoff } = finiteSupportDecay(time, duration, halfLife);
+    const correction = poseOffset.clone()
+      .addScaledVector(linearTerm, time)
+      .multiplyScalar(Math.exp(-lambda * time) * cutoff);
+    const q = quaternions[i].clone().multiply(quaternionExp(correction)).normalize();
+    const offset = i * 4;
+    corrected[offset] = q.x;
+    corrected[offset + 1] = q.y;
+    corrected[offset + 2] = q.z;
+    corrected[offset + 3] = q.w;
+  }
+  track.values = corrected;
+  return true;
+}
+
+/** Repairs one pristine clip for the requested loop strategy. */
 export function repairAnimationLoop(
   source: THREE.AnimationClip,
   shouldRepairTrack: TrackFilter = () => true,
+  options: AnimationLoopFixOptions = {},
 ): { clip: THREE.AnimationClip; report: AnimationLoopFixReport } {
+  const mode = options.mode ?? "cyclic";
+  const inertialHalfLife = options.inertialHalfLife ?? DEFAULT_INERTIAL_HALF_LIFE;
   const clip = source.clone();
   const report: AnimationLoopFixReport = {
     repairedPositionTracks: 0,
@@ -179,19 +271,23 @@ export function repairAnimationLoop(
       return;
     }
     if (track instanceof THREE.QuaternionKeyframeTrack) {
-      if (repairQuaternionTrack(track)) report.repairedQuaternionTracks += 1;
+      const repaired = mode === "inertial"
+        ? repairQuaternionTrackInertial(track, inertialHalfLife)
+        : repairQuaternionTrackCyclic(track);
+      if (repaired) report.repairedQuaternionTracks += 1;
       else report.skippedTracks += 1;
       return;
     }
     if (track instanceof THREE.VectorKeyframeTrack && track.name.endsWith(".position")) {
-      if (repairVectorTrack(track)) report.repairedPositionTracks += 1;
+      if (repairVectorTrack(track, mode, inertialHalfLife)) report.repairedPositionTracks += 1;
       else report.skippedTracks += 1;
       return;
     }
     report.skippedTracks += 1;
   });
 
-  clip.name = source.name ? `${source.name} (Loop Fixed)` : "Loop Fixed";
+  const suffix = mode === "inertial" ? "Inertial Loop Fixed" : "Cyclic Loop Fixed";
+  clip.name = source.name ? `${source.name} (${suffix})` : suffix;
   clip.resetDuration();
   return { clip, report };
 }

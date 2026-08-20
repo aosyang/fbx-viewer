@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { FBXLoader } from "./loaders/FastFBXLoader.js";
 import { retargetClipToCanonicalBones } from "./lib/animation-retarget";
-import { repairAnimationLoop } from "./lib/animation-loop-fix";
-import { repairBinaryFbxAnimationLoop } from "./lib/fbx-animation-loop-fix";
+import { repairAnimationLoop, type AnimationLoopFixMode } from "./lib/animation-loop-fix";
+import { repairBinaryFbxAnimationLoop, restoreBinaryFbxAnimationCurves } from "./lib/fbx-animation-loop-fix";
 import {
   readBinaryFbx,
   writeBinaryFbx,
@@ -621,7 +621,7 @@ export default function App() {
   const selectBoneRef = useRef<(boneId: string) => void>(() => undefined);
   const frameObjectRef = useRef<() => void>(() => undefined);
   const saveFbxRef = useRef<(selection: FbxExportSelection) => void>(() => undefined);
-  const fixAnimationLoopRef = useRef<() => void>(() => undefined);
+  const fixAnimationLoopRef = useRef<(mode: AnimationLoopFixMode) => void>(() => undefined);
   const seekAnimationRef = useRef<(time: number) => void>(() => undefined);
   const setAnimationPlayingRef = useRef<(playing: boolean) => void>(
     () => undefined,
@@ -656,6 +656,8 @@ export default function App() {
   const [displayMenuOpen, setDisplayMenuOpen] = useState(false);
   const [animationImport, setAnimationImport] =
     useState<AnimationImportPreview | null>(null);
+  const [animationLoopFixMode, setAnimationLoopFixMode] =
+    useState<AnimationLoopFixMode>("cyclic");
   const [animationModelAlternative, setAnimationModelAlternative] = useState<{
     file: File;
     resources: File[];
@@ -736,6 +738,9 @@ export default function App() {
     let releaseModelResources: () => void = () => {};
     let mixer: THREE.AnimationMixer | null = null;
     let animationActions: THREE.AnimationAction[] = [];
+    let pristineAnimationClips: THREE.AnimationClip[] = [];
+    let loadedAnimationBinaryBaseline: BinaryFbxDocument | null = null;
+    let activeAnimationBinaryBaseline: BinaryFbxDocument | null = null;
     let animationDuration = 0;
     let animationClipName = "";
     let animationFrameBounds: THREE.Box3 | null = null;
@@ -923,7 +928,9 @@ export default function App() {
     const setActiveAnimation = (
       nextMixer: THREE.AnimationMixer,
       clips: THREE.AnimationClip[],
+      rememberPristineSource = true,
     ) => {
+      if (rememberPristineSource) pristineAnimationClips = clips.map((clip) => clip.clone());
       mixer = nextMixer;
       animationActions = clips.map((clip) =>
         nextMixer.clipAction(clip).reset().play(),
@@ -947,14 +954,14 @@ export default function App() {
       frameObject();
     };
 
-    fixAnimationLoopRef.current = () => {
-      if (!model || animationActions.length === 0) return;
+    fixAnimationLoopRef.current = (mode: AnimationLoopFixMode) => {
+      if (!model || pristineAnimationClips.length === 0) return;
       const wasPlaying = animationActions.some((action) => !action.paused);
       const previousTime = getAnimationTime();
       let repairedPositionTracks = 0;
       let repairedQuaternionTracks = 0;
-      const repairedClips = animationActions.map((action) => {
-        const result = repairAnimationLoop(action.getClip(), (track) => {
+      const repairedClips = pristineAnimationClips.map((sourceClip) => {
+        const result = repairAnimationLoop(sourceClip, (track) => {
           try {
             const parsed = THREE.PropertyBinding.parseTrackName(track.name);
             const target =
@@ -964,7 +971,7 @@ export default function App() {
           } catch {
             return false;
           }
-        });
+        }, { mode });
         repairedPositionTracks += result.report.repairedPositionTracks;
         repairedQuaternionTracks += result.report.repairedQuaternionTracks;
         return result.clip;
@@ -974,16 +981,23 @@ export default function App() {
       const binaryAnimationDocument = externalAnimationApplied
         ? activeAnimationBinaryDocument
         : loadedBinaryDocument;
+      const binaryBaseline = externalAnimationApplied
+        ? activeAnimationBinaryBaseline
+        : loadedAnimationBinaryBaseline;
+      if (binaryAnimationDocument && binaryBaseline) {
+        restoreBinaryFbxAnimationCurves(binaryAnimationDocument, binaryBaseline);
+      }
       const binaryReport = binaryAnimationDocument
-        ? repairBinaryFbxAnimationLoop(binaryAnimationDocument)
+        ? repairBinaryFbxAnimationLoop(binaryAnimationDocument, { mode })
         : null;
 
       clearCurrentAnimation();
       const repairedMixer = new THREE.AnimationMixer(model);
-      setActiveAnimation(repairedMixer, repairedClips);
+      setActiveAnimation(repairedMixer, repairedClips, false);
       seekAnimationRef.current(Math.min(previousTime, animationDuration));
       setAnimationPlayingRef.current(wasPlaying);
-      console.info("[FBX Viewer] Animation loop repaired", {
+      console.info("[FBX Viewer] Animation loop repaired from pristine source", {
+        mode,
         repairedPositionTracks,
         repairedQuaternionTracks,
         binary: binaryReport,
@@ -1272,6 +1286,9 @@ export default function App() {
       setActiveAnimation(mixer, [importedClip]);
       mixer.update(0);
       activeAnimationBinaryDocument = pendingAnimationBinaryDocument;
+      activeAnimationBinaryBaseline = pendingAnimationBinaryDocument
+        ? readBinaryFbx(writeBinaryFbx(pendingAnimationBinaryDocument))
+        : null;
       activeAnimationFileName = pendingAnimationFileName;
       externalAnimationApplied = true;
       const baseAvailability = analyzeFbxExportContents(loadedBinaryDocument);
@@ -1300,8 +1317,10 @@ export default function App() {
       setExportAvailability({ character: false, animation: false });
       setSaveDialog(null);
       loadedBinaryDocument = null;
+      loadedAnimationBinaryBaseline = null;
       loadedBinaryFileName = "";
       activeAnimationBinaryDocument = null;
+      activeAnimationBinaryBaseline = null;
       activeAnimationFileName = "";
       externalAnimationApplied = false;
       setMessage("Loading model…");
@@ -1363,6 +1382,7 @@ export default function App() {
             .setMaxMorphTargets(MAX_RENDERED_MORPH_TARGETS);
           model = loader.parse(sourceBuffer, "");
           loadedBinaryDocument = binaryDocument;
+          loadedAnimationBinaryBaseline = readBinaryFbx(sourceBuffer.slice(0));
           loadedBinaryFileName = file.name;
           setExportAvailability(analyzeFbxExportContents(binaryDocument));
           loadStage = "model scene setup";
@@ -2047,14 +2067,30 @@ export default function App() {
                     >
                       <span className="timeline-step-icon" aria-hidden="true" />
                     </button>
-                    <button
-                      className="timeline-loop-fix"
-                      type="button"
-                      title="Smooth the active animation across the loop boundary"
-                      onClick={() => fixAnimationLoopRef.current()}
-                    >
-                      Fix Loop
-                    </button>
+                    <div className="timeline-loop-fix-group">
+                      <select
+                        className="timeline-loop-mode"
+                        aria-label="Loop repair mode"
+                        title={animationLoopFixMode === "cyclic"
+                          ? "Cyclic: distribute seam correction across the full cycle"
+                          : "Inertial: match the seam at the start, then decay back to the original motion"}
+                        value={animationLoopFixMode}
+                        onChange={(event) =>
+                          setAnimationLoopFixMode(event.target.value as AnimationLoopFixMode)
+                        }
+                      >
+                        <option value="cyclic">Cyclic</option>
+                        <option value="inertial">Inertial</option>
+                      </select>
+                      <button
+                        className="timeline-loop-fix"
+                        type="button"
+                        title="Repair the loop from the original animation source"
+                        onClick={() => fixAnimationLoopRef.current(animationLoopFixMode)}
+                      >
+                        Fix Loop
+                      </button>
+                    </div>
                   </div>
                   <div className="timeline-meta">
                     <span title={animationTimeline.clipName}>

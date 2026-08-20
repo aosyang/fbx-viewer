@@ -2,7 +2,11 @@ import {
   BinaryFbxDocument,
   type FbxNode,
 } from "./binary-fbx";
-import { repairLoopScalarSamples } from "./animation-loop-fix";
+import {
+  repairLoopScalarSamples,
+  repairLoopScalarSamplesInertial,
+  type AnimationLoopFixMode,
+} from "./animation-loop-fix";
 
 export type BinaryFbxLoopFixReport = {
   repairedTranslationCurves: number;
@@ -11,10 +15,18 @@ export type BinaryFbxLoopFixReport = {
   skippedCurves: number;
 };
 
+export type BinaryFbxLoopFixOptions = {
+  mode?: AnimationLoopFixMode;
+  inertialHalfLife?: number;
+};
+
 type CurveTarget = {
   modelName: string;
   propertyName: "Lcl Translation" | "Lcl Rotation";
 };
+
+const FBX_TIME_TICKS_PER_SECOND = 46186158000;
+const DEFAULT_INERTIAL_HALF_LIFE = 0.09;
 
 function bigintProperty(node: FbxNode, index: number): bigint | null {
   const property = node.properties[index];
@@ -39,20 +51,42 @@ function isRootModelName(name: string): boolean {
   return leaf === "root" || leaf === "rootnode";
 }
 
-function connectionEndpoint(node: FbxNode, index: number): bigint | null {
-  return bigintProperty(node, index);
+function childProperty(node: FbxNode, childName: string) {
+  return node.children.find((child) => child.name === childName)?.properties[0];
 }
 
-/**
- * Repairs raw FBX AnimationCurve key values so Save FBX contains the loop fix.
- *
- * The browser preview repairs quaternion tracks in SO(3). FBX stores Lcl Rotation as
- * Euler component curves, so this export path applies the same endpoint C0/C1/C2
- * polynomial directly in native FBX curve space. Root curves are deliberately preserved.
- */
+/** Restore only animation key values, preserving unrelated edits in the working FBX document. */
+export function restoreBinaryFbxAnimationCurves(
+  target: BinaryFbxDocument,
+  pristine: BinaryFbxDocument,
+): number {
+  const sourceCurves = new Map<bigint, FbxNode>();
+  pristine.findNodes("AnimationCurve").forEach((curve) => {
+    const id = bigintProperty(curve, 0);
+    if (id != null) sourceCurves.set(id, curve);
+  });
+
+  let restored = 0;
+  target.findNodes("AnimationCurve").forEach((curve) => {
+    const id = bigintProperty(curve, 0);
+    if (id == null) return;
+    const source = sourceCurves.get(id);
+    if (!source) return;
+    const targetValues = childProperty(curve, "KeyValueFloat");
+    const sourceValues = childProperty(source, "KeyValueFloat");
+    if (!targetValues || !sourceValues) return;
+    targetValues.replaceArray(sourceValues.readArray());
+    restored += 1;
+  });
+  return restored;
+}
+
 export function repairBinaryFbxAnimationLoop(
   document: BinaryFbxDocument,
+  options: BinaryFbxLoopFixOptions = {},
 ): BinaryFbxLoopFixReport {
+  const mode = options.mode ?? "cyclic";
+  const halfLife = options.inertialHalfLife ?? DEFAULT_INERTIAL_HALF_LIFE;
   const report: BinaryFbxLoopFixReport = {
     repairedTranslationCurves: 0,
     repairedRotationCurves: 0,
@@ -78,11 +112,10 @@ export function repairBinaryFbxAnimationLoop(
 
   const curveNodeTargets = new Map<bigint, CurveTarget>();
   const curveToNode = new Map<bigint, bigint>();
-
   document.findNodes("C").forEach((connection) => {
     if (stringProperty(connection, 0) !== "OP") return;
-    const source = connectionEndpoint(connection, 1);
-    const destination = connectionEndpoint(connection, 2);
+    const source = bigintProperty(connection, 1);
+    const destination = bigintProperty(connection, 2);
     if (source == null || destination == null) return;
     const propertyName = stringProperty(connection, 3);
 
@@ -92,10 +125,7 @@ export function repairBinaryFbxAnimationLoop(
         modelName: visibleObjectName(models.get(destination)!),
         propertyName,
       });
-      return;
-    }
-
-    if (curves.has(source) && curveNodes.has(destination)) {
+    } else if (curves.has(source) && curveNodes.has(destination)) {
       curveToNode.set(source, destination);
     }
   });
@@ -112,20 +142,31 @@ export function repairBinaryFbxAnimationLoop(
       return;
     }
 
-    const keyValues = curve.children.find((child) => child.name === "KeyValueFloat")?.properties[0];
-    if (!keyValues || (keyValues.code !== "f" && keyValues.code !== "d")) {
+    const valuesProperty = childProperty(curve, "KeyValueFloat");
+    if (!valuesProperty || valuesProperty.code !== "f") {
       report.skippedCurves += 1;
       return;
     }
-
-    const values = keyValues.readArray().map(Number);
+    const values = valuesProperty.readArray().map(Number);
     if (values.length < 4) {
       report.skippedCurves += 1;
       return;
     }
-    const repaired = repairLoopScalarSamples(values);
-    keyValues.replaceArray(repaired, keyValues.arrayEncoding === 1);
 
+    let repaired: Float32Array;
+    if (mode === "inertial") {
+      const keyTimeProperty = childProperty(curve, "KeyTime");
+      if (!keyTimeProperty || keyTimeProperty.code !== "l") {
+        report.skippedCurves += 1;
+        return;
+      }
+      const keyTimes = keyTimeProperty.readArray().map((value) => Number(value) / FBX_TIME_TICKS_PER_SECOND);
+      repaired = repairLoopScalarSamplesInertial(values, keyTimes, halfLife);
+    } else {
+      repaired = repairLoopScalarSamples(values);
+    }
+
+    valuesProperty.replaceArray(repaired);
     if (target.propertyName === "Lcl Translation") report.repairedTranslationCurves += 1;
     else report.repairedRotationCurves += 1;
   });
