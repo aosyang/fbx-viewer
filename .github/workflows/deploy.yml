@@ -2,7 +2,7 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -21,17 +21,44 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout production
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: production
+
+      - name: Checkout development
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          path: development
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
+
+      - name: Build production
+        working-directory: production
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build development
+        working-directory: development
+        run: |
+          npm ci
+          npm run build
+
+      - name: Assemble Pages artifact
+        run: |
+          mkdir -p site/dev
+          cp -a production/dist/. site/
+          cp -a development/dist/. site/dev/
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dist
+          path: site
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
