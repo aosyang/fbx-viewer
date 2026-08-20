@@ -1,3 +1,5 @@
+import { unzlibSync, zlibSync } from "three/examples/jsm/libs/fflate.module.js";
+
 const MAGIC = new Uint8Array([
   0x4b,0x61,0x79,0x64,0x61,0x72,0x61,0x20,0x46,0x42,0x58,0x20,0x42,0x69,0x6e,0x61,0x72,0x79,0x20,0x20,0x00,0x1a,0x00,
 ]);
@@ -7,6 +9,7 @@ const textEncoder = new TextEncoder();
 
 type ScalarCode = 'Y' | 'C' | 'I' | 'F' | 'D' | 'L';
 type ArrayCode = 'f' | 'd' | 'l' | 'i' | 'b';
+export type FbxArrayScalar = number | bigint | boolean;
 export type PropertyCode = ScalarCode | 'S' | 'R' | ArrayCode;
 
 export class BinaryFbxError extends Error {}
@@ -32,6 +35,24 @@ export class FbxProperty {
     }
     this.value = value;
     this.raw = encodeScalarProperty(this.code as ScalarCode, value);
+  }
+
+  readArray(): FbxArrayScalar[] {
+    if (!['f','d','l','i','b'].includes(this.code)) {
+      throw new BinaryFbxError(`readArray requires array property, got ${this.code}`);
+    }
+    return decodeArrayProperty(this);
+  }
+
+  replaceArray(values: ArrayLike<FbxArrayScalar>, compress = this.arrayEncoding === 1): void {
+    if (!['f','d','l','i','b'].includes(this.code)) {
+      throw new BinaryFbxError(`replaceArray requires array property, got ${this.code}`);
+    }
+    const copied = Array.from(values);
+    this.value = copied;
+    this.arrayCount = copied.length;
+    this.arrayEncoding = compress ? 1 : 0;
+    this.raw = encodeArrayProperty(this.code as ArrayCode, copied, compress);
   }
 }
 
@@ -266,6 +287,71 @@ function encodeScalarProperty(code: ScalarCode, value: number | bigint | boolean
     case 'D': v.setFloat64(1, Number(value), true); break;
     case 'L': v.setBigInt64(1, BigInt(value), true); break;
   }
+  return out;
+}
+
+
+const ARRAY_ITEM_SIZE: Record<ArrayCode, number> = { f: 4, d: 8, l: 8, i: 4, b: 1 };
+
+function decodeArrayProperty(property: FbxProperty): FbxArrayScalar[] {
+  const code = property.code as ArrayCode;
+  const count = property.arrayCount;
+  const encoding = property.arrayEncoding;
+  if (count == null || encoding == null) throw new BinaryFbxError('array metadata missing');
+  if (property.raw.length < 13) throw new BinaryFbxError('array property payload is truncated');
+
+  let payload = property.raw.slice(13);
+  if (encoding === 1) payload = unzlibSync(payload);
+  else if (encoding !== 0) throw new BinaryFbxError(`unsupported array encoding ${encoding}`);
+
+  const itemSize = ARRAY_ITEM_SIZE[code];
+  const expected = count * itemSize;
+  if (payload.byteLength !== expected) {
+    throw new BinaryFbxError(`array decoded bytes ${payload.byteLength} != expected ${expected}`);
+  }
+
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const values: FbxArrayScalar[] = new Array(count);
+  for (let i = 0; i < count; i += 1) {
+    const offset = i * itemSize;
+    switch (code) {
+      case 'f': values[i] = view.getFloat32(offset, true); break;
+      case 'd': values[i] = view.getFloat64(offset, true); break;
+      case 'l': values[i] = view.getBigInt64(offset, true); break;
+      case 'i': values[i] = view.getInt32(offset, true); break;
+      case 'b': values[i] = view.getUint8(offset) !== 0; break;
+    }
+  }
+  return values;
+}
+
+function encodeArrayProperty(
+  code: ArrayCode,
+  values: readonly FbxArrayScalar[],
+  compress: boolean,
+): Uint8Array {
+  const itemSize = ARRAY_ITEM_SIZE[code];
+  const unpacked = new Uint8Array(values.length * itemSize);
+  const view = new DataView(unpacked.buffer);
+  values.forEach((value, index) => {
+    const offset = index * itemSize;
+    switch (code) {
+      case 'f': view.setFloat32(offset, Number(value), true); break;
+      case 'd': view.setFloat64(offset, Number(value), true); break;
+      case 'l': view.setBigInt64(offset, BigInt(value), true); break;
+      case 'i': view.setInt32(offset, Number(value), true); break;
+      case 'b': view.setUint8(offset, value ? 1 : 0); break;
+    }
+  });
+
+  const payload = compress ? zlibSync(unpacked) : unpacked;
+  const out = new Uint8Array(13 + payload.length);
+  out[0] = code.charCodeAt(0);
+  const header = new DataView(out.buffer);
+  header.setUint32(1, values.length, true);
+  header.setUint32(5, compress ? 1 : 0, true);
+  header.setUint32(9, payload.length, true);
+  out.set(payload, 13);
   return out;
 }
 

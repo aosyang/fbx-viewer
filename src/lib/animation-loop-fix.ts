@@ -26,6 +26,29 @@ function quinticCorrection(
   return a3 * t3 + a4 * t3 * t + a5 * t3 * t2;
 }
 
+
+export function repairLoopScalarSamples(source: ArrayLike<number>): Float32Array {
+  const count = source.length;
+  const corrected = new Float32Array(count);
+  for (let i = 0; i < count; i += 1) corrected[i] = Number(source[i]);
+  if (count < 4) return corrected;
+
+  const at = (index: number) => Number(source[index]);
+  const c0 = at(0) - at(count - 1);
+  const startD1 = at(1) - at(0);
+  const endD1 = at(count - 1) - at(count - 2);
+  const startD2 = at(2) - 2 * at(1) + at(0);
+  const endD2 = at(count - 1) - 2 * at(count - 2) + at(count - 3);
+  const d1 = startD1 - endD1;
+  const d2 = startD2 - endD2;
+
+  for (let i = 0; i < count; i += 1) {
+    const t = i / (count - 1);
+    corrected[i] = at(i) + quinticCorrection(c0, d1, d2, count, t);
+  }
+  return corrected;
+}
+
 function repairVectorTrack(track: THREE.VectorKeyframeTrack) {
   const count = track.times.length;
   if (count < 4 || track.values.length !== count * 3) return false;
@@ -34,19 +57,9 @@ function repairVectorTrack(track: THREE.VectorKeyframeTrack) {
   corrected.set(values as ArrayLike<number>);
 
   for (let axis = 0; axis < 3; axis += 1) {
-    const at = (index: number) => Number(values[index * 3 + axis]);
-    const c0 = at(0) - at(count - 1);
-    const startD1 = at(1) - at(0);
-    const endD1 = at(count - 1) - at(count - 2);
-    const startD2 = at(2) - 2 * at(1) + at(0);
-    const endD2 = at(count - 1) - 2 * at(count - 2) + at(count - 3);
-    const d1 = startD1 - endD1;
-    const d2 = startD2 - endD2;
-
-    for (let i = 0; i < count; i += 1) {
-      const t = i / (count - 1);
-      corrected[i * 3 + axis] = at(i) + quinticCorrection(c0, d1, d2, count, t);
-    }
+    const axisValues = Array.from({ length: count }, (_, index) => Number(values[index * 3 + axis]));
+    const repaired = repairLoopScalarSamples(axisValues);
+    for (let i = 0; i < count; i += 1) corrected[i * 3 + axis] = repaired[i];
   }
 
   track.values = corrected;

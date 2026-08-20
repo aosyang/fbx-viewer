@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { FBXLoader } from "./loaders/FastFBXLoader.js";
 import { retargetClipToCanonicalBones } from "./lib/animation-retarget";
 import { repairAnimationLoop } from "./lib/animation-loop-fix";
+import { repairBinaryFbxAnimationLoop } from "./lib/fbx-animation-loop-fix";
 import {
   readBinaryFbx,
   writeBinaryFbx,
@@ -970,6 +971,13 @@ export default function App() {
       });
       if (repairedPositionTracks + repairedQuaternionTracks === 0) return;
 
+      const binaryAnimationDocument = externalAnimationApplied
+        ? activeAnimationBinaryDocument
+        : loadedBinaryDocument;
+      const binaryReport = binaryAnimationDocument
+        ? repairBinaryFbxAnimationLoop(binaryAnimationDocument)
+        : null;
+
       clearCurrentAnimation();
       const repairedMixer = new THREE.AnimationMixer(model);
       setActiveAnimation(repairedMixer, repairedClips);
@@ -978,6 +986,7 @@ export default function App() {
       console.info("[FBX Viewer] Animation loop repaired", {
         repairedPositionTracks,
         repairedQuaternionTracks,
+        binary: binaryReport,
       });
     };
 

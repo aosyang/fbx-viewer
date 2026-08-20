@@ -24,6 +24,7 @@ const ANIMATION_OBJECT_TYPES = new Set([
 
 function cloneValue(value: unknown): unknown {
   if (value instanceof Uint8Array) return value.slice();
+  if (Array.isArray(value)) return value.slice();
   return value;
 }
 
