@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { FBXLoader } from "./loaders/FastFBXLoader.js";
 import { retargetClipToCanonicalBones } from "./lib/animation-retarget";
+import { repairAnimationLoop } from "./lib/animation-loop-fix";
 import {
   readBinaryFbx,
   writeBinaryFbx,
@@ -619,6 +620,7 @@ export default function App() {
   const selectBoneRef = useRef<(boneId: string) => void>(() => undefined);
   const frameObjectRef = useRef<() => void>(() => undefined);
   const saveFbxRef = useRef<(selection: FbxExportSelection) => void>(() => undefined);
+  const fixAnimationLoopRef = useRef<() => void>(() => undefined);
   const seekAnimationRef = useRef<(time: number) => void>(() => undefined);
   const setAnimationPlayingRef = useRef<(playing: boolean) => void>(
     () => undefined,
@@ -942,6 +944,41 @@ export default function App() {
       }
       syncAnimationTimeline(true);
       frameObject();
+    };
+
+    fixAnimationLoopRef.current = () => {
+      if (!model || animationActions.length === 0) return;
+      const wasPlaying = animationActions.some((action) => !action.paused);
+      const previousTime = getAnimationTime();
+      let repairedPositionTracks = 0;
+      let repairedQuaternionTracks = 0;
+      const repairedClips = animationActions.map((action) => {
+        const result = repairAnimationLoop(action.getClip(), (track) => {
+          try {
+            const parsed = THREE.PropertyBinding.parseTrackName(track.name);
+            const target =
+              model?.getObjectByProperty("uuid", parsed.nodeName) ??
+              model?.getObjectByName(parsed.nodeName);
+            return target instanceof THREE.Bone;
+          } catch {
+            return false;
+          }
+        });
+        repairedPositionTracks += result.report.repairedPositionTracks;
+        repairedQuaternionTracks += result.report.repairedQuaternionTracks;
+        return result.clip;
+      });
+      if (repairedPositionTracks + repairedQuaternionTracks === 0) return;
+
+      clearCurrentAnimation();
+      const repairedMixer = new THREE.AnimationMixer(model);
+      setActiveAnimation(repairedMixer, repairedClips);
+      seekAnimationRef.current(Math.min(previousTime, animationDuration));
+      setAnimationPlayingRef.current(wasPlaying);
+      console.info("[FBX Viewer] Animation loop repaired", {
+        repairedPositionTracks,
+        repairedQuaternionTracks,
+      });
     };
 
     seekAnimationRef.current = (time: number) => {
@@ -1441,6 +1478,7 @@ export default function App() {
         selectionMarker.material.dispose();
       }
       saveFbxRef.current = () => undefined;
+      fixAnimationLoopRef.current = () => undefined;
       renderer.dispose();
       renderer.domElement.remove();
     };
@@ -1999,6 +2037,14 @@ export default function App() {
                       onClick={() => seekAnimationByFrame(1)}
                     >
                       <span className="timeline-step-icon" aria-hidden="true" />
+                    </button>
+                    <button
+                      className="timeline-loop-fix"
+                      type="button"
+                      title="Smooth the active animation across the loop boundary"
+                      onClick={() => fixAnimationLoopRef.current()}
+                    >
+                      Fix Loop
                     </button>
                   </div>
                   <div className="timeline-meta">
